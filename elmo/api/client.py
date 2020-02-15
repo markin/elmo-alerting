@@ -8,6 +8,8 @@ from .decorators import require_lock, require_session
 from .exceptions import PermissionDenied
 from .router import Router
 
+SECTOR_CLASS = 9
+INPUT_CLASS = 10
 
 class ElmoClient(object):
     """ElmoClient class provides all the functionalities to connect
@@ -26,38 +28,120 @@ class ElmoClient(object):
     """
 
     def __init__(self, base_url, vendor, session_id=None):
-        self._router = Router(base_url, vendor)
+        self._router = Router(base_url)
         self._session = Session()
-        self._session_id = session_id
         self._lock = Lock()
+
+        self._session_id = session_id
+        self._vendor = vendor
+
+        self._strings = None
+        self._areas = None
+        self._inputs = None
 
     def auth(self, username, password):
         """Authenticate the client and retrieves the access token. This API uses
-        a standard authentication form, so even if the authentication fails, a
-        2xx status code is returned. In that case, the `session_id` is validated
-        to see if the call was a success.
+        the authentication API. 
 
         Args:
             username: the Username used for the authentication.
             password: the Password used for the authentication.
         Raises:
-            PermissionDenied: if wrong credentials are used.
             HTTPError: if there is an error raised by the API (not 2xx response).
         Returns:
-            The access token retrieved from the scraped page. The token is also
+            The access token retrieved from the API. The token is also
             cached in the `ElmoClient` instance.
         """
-        payload = {"UserName": username, "Password": password, "RememberMe": False}
-        response = self._session.post(self._router.auth, data=payload)
+        payload = {"username": username, "password": password, "domain": self._vendor}
+        response = self._session.get(self._router.auth, params=payload)
         response.raise_for_status()
 
-        self._session_id = parser.get_access_token(response.text)
-        self._router._api_url = parser.get_api_url(response.text)
+        data = response.json()
+        self._session_id = data['SessionId']
 
-        if self._session_id is None:
-            raise PermissionDenied("Incorrect authentication credentials")
+        if data['Redirect']:
+            self._router = Router(data['RedirectTo'])
+            self._session_id = self.auth(username, password)
+            return self._session_id
 
         return self._session_id
+
+    def _set_name(self, element, class_):
+        index = element['Index']
+        name = next(filter(lambda x: x['Class'] == class_ and x['Index'] == index, self._strings), None)['Description']
+        element['Name'] = name
+        return element
+
+    def update(self):
+        """
+        Fetch data from API returning names of the items.
+        """
+        payload = {"sessionId": self._session_id}
+
+        if not self._strings:
+            response = self._session.post(self._router.strings, data=payload)
+            response.raise_for_status()
+
+            self._strings = response.json()
+
+        response = self._session.post(self._router.areas, data=payload)
+        response.raise_for_status()
+
+        self._areas = list(filter(lambda area: area['InUse'], response.json()))
+        self._areas = list(map(lambda x: self._set_name(x, SECTOR_CLASS), self._areas))
+
+        response = self._session.post(self._router.inputs, data=payload)
+        response.raise_for_status()
+
+        self._inputs = list(filter(lambda input_: input_['InUse'], response.json()))
+        self._inputs = list(map(lambda x: self._set_name(x, INPUT_CLASS), self._inputs))
+
+        print(self._areas)
+        print("")
+        print(self._inputs)
+
+    def update_state(self):
+        payload = {"sessionId": self._session_id}
+
+        urls = [self._router.areas, self._router.inputs, self._router.strings]
+        response = (grequests.post(url, data=payload) for url in urls)
+        response = grequests.map(response, size=len(urls))
+
+        for rs in response:
+            print(rs.json())
+        #response = self._session.post(self._router.strings, data=payload)
+        #response.raise_for_status()
+
+        # rs = (grequests.get(u) for u in [BASE.format(t) for t in tickers])
+        # rs = grequests.map(rs)
+
+    # def auth(self, username, password):
+    #     """Authenticate the client and retrieves the access token. This API uses
+    #     a standard authentication form, so even if the authentication fails, a
+    #     2xx status code is returned. In that case, the `session_id` is validated
+    #     to see if the call was a success.
+
+    #     Args:
+    #         username: the Username used for the authentication.
+    #         password: the Password used for the authentication.
+    #     Raises:
+    #         PermissionDenied: if wrong credentials are used.
+    #         HTTPError: if there is an error raised by the API (not 2xx response).
+    #     Returns:
+    #         The access token retrieved from the scraped page. The token is also
+    #         cached in the `ElmoClient` instance.
+    #     """
+    #     payload = {"UserName": username, "Password": password, "RememberMe": False}
+    #     response = self._session.post(self._router.auth, data=payload)
+    #     response.raise_for_status()
+
+    #     self._session_id = parser.get_access_token(response.text)
+    #     self._router._api_url = parser.get_api_url(response.text)
+
+    #     if self._session_id is None:
+    #         raise PermissionDenied("Incorrect authentication credentials")
+
+    #     return self._session_id
 
     @contextmanager
     @require_session
