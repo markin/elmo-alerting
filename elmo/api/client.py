@@ -1,15 +1,17 @@
+import re
+
 from contextlib import contextmanager
 from threading import Lock
 
 from requests import Session
 
-from ..utils import parser, response_helper
+from .elmo_item import ElmoItem
 from .decorators import require_lock, require_session
 from .exceptions import PermissionDenied
 from .router import Router
+from .const import ARM_COMMAND, DISARM_COMMAND, SECTOR_CLASS, INPUT_CLASS
+from .utils import re_case
 
-SECTOR_CLASS = 9
-INPUT_CLASS = 10
 
 class ElmoClient(object):
     """ElmoClient class provides all the functionalities to connect
@@ -39,6 +41,17 @@ class ElmoClient(object):
         self._areas = None
         self._inputs = None
 
+    def add_name(self, element, class_):
+        index = element["Index"]
+        name = next(
+            filter(
+                lambda x: x["Class"] == class_ and x["Index"] == index, self._strings
+            ),
+            None,
+        )["Description"]
+        element["Name"] = name
+        return element
+
     def auth(self, username, password):
         """Authenticate the client and retrieves the access token. This API uses
         the authentication API. 
@@ -57,21 +70,53 @@ class ElmoClient(object):
         response.raise_for_status()
 
         data = response.json()
-        self._session_id = data['SessionId']
+        self._session_id = data["SessionId"]
 
-        if data['Redirect']:
-            self._router = Router(data['RedirectTo'])
+        if data["Redirect"]:
+            self._router = Router(data["RedirectTo"])
             self._session_id = self.auth(username, password)
             return self._session_id
 
         return self._session_id
 
-    def _set_name(self, element, class_):
-        index = element['Index']
-        name = next(filter(lambda x: x['Class'] == class_ and x['Index'] == index, self._strings), None)['Description']
-        element['Name'] = name
-        return element
+    @require_session
+    def update_strings(self):
+        payload = {"sessionId": self._session_id}
 
+        response = self._session.post(self._router.strings, data=payload)
+        response.raise_for_status()
+
+        self._strings = response.json()
+
+    @require_session
+    def update_areas(self):
+        payload = {"sessionId": self._session_id}
+
+        response = self._session.post(self._router.areas, data=payload)
+        response.raise_for_status()
+
+        self._areas = list(filter(lambda area: area["InUse"], response.json()))
+        self._areas = list(map(lambda x: self.add_name(x, SECTOR_CLASS), self._areas))
+        self._areas = list(
+            map(lambda x: {re_case(k): v for k, v in x.items()}, self._areas)
+        )
+        self._areas = list(map(lambda x: ElmoItem(**x), self._areas))
+
+    @require_session
+    def update_inputs(self):
+        payload = {"sessionId": self._session_id}
+
+        response = self._session.post(self._router.inputs, data=payload)
+        response.raise_for_status()
+
+        self._inputs = list(filter(lambda input_: input_["InUse"], response.json()))
+        self._inputs = list(map(lambda x: self.add_name(x, INPUT_CLASS), self._inputs))
+        self._inputs = list(
+            map(lambda x: {re_case(k): v for k, v in x.items()}, self._inputs)
+        )
+        self._inputs = list(map(lambda x: ElmoItem(**x), self._inputs))
+
+    @require_session
     def update(self):
         """
         Fetch data from API returning names of the items.
@@ -79,69 +124,13 @@ class ElmoClient(object):
         payload = {"sessionId": self._session_id}
 
         if not self._strings:
-            response = self._session.post(self._router.strings, data=payload)
-            response.raise_for_status()
+            self.update_strings()
 
-            self._strings = response.json()
+        self.update_areas()
+        self.update_inputs()
 
-        response = self._session.post(self._router.areas, data=payload)
-        response.raise_for_status()
-
-        self._areas = list(filter(lambda area: area['InUse'], response.json()))
-        self._areas = list(map(lambda x: self._set_name(x, SECTOR_CLASS), self._areas))
-
-        response = self._session.post(self._router.inputs, data=payload)
-        response.raise_for_status()
-
-        self._inputs = list(filter(lambda input_: input_['InUse'], response.json()))
-        self._inputs = list(map(lambda x: self._set_name(x, INPUT_CLASS), self._inputs))
-
-        print(self._areas)
-        print("")
-        print(self._inputs)
-
-    def update_state(self):
-        payload = {"sessionId": self._session_id}
-
-        urls = [self._router.areas, self._router.inputs, self._router.strings]
-        response = (grequests.post(url, data=payload) for url in urls)
-        response = grequests.map(response, size=len(urls))
-
-        for rs in response:
-            print(rs.json())
-        #response = self._session.post(self._router.strings, data=payload)
-        #response.raise_for_status()
-
-        # rs = (grequests.get(u) for u in [BASE.format(t) for t in tickers])
-        # rs = grequests.map(rs)
-
-    # def auth(self, username, password):
-    #     """Authenticate the client and retrieves the access token. This API uses
-    #     a standard authentication form, so even if the authentication fails, a
-    #     2xx status code is returned. In that case, the `session_id` is validated
-    #     to see if the call was a success.
-
-    #     Args:
-    #         username: the Username used for the authentication.
-    #         password: the Password used for the authentication.
-    #     Raises:
-    #         PermissionDenied: if wrong credentials are used.
-    #         HTTPError: if there is an error raised by the API (not 2xx response).
-    #     Returns:
-    #         The access token retrieved from the scraped page. The token is also
-    #         cached in the `ElmoClient` instance.
-    #     """
-    #     payload = {"UserName": username, "Password": password, "RememberMe": False}
-    #     response = self._session.post(self._router.auth, data=payload)
-    #     response.raise_for_status()
-
-    #     self._session_id = parser.get_access_token(response.text)
-    #     self._router._api_url = parser.get_api_url(response.text)
-
-    #     if self._session_id is None:
-    #         raise PermissionDenied("Incorrect authentication credentials")
-
-    #     return self._session_id
+    def get_items(self):
+        return {"areas": self._areas, "inputs": self._inputs}
 
     @contextmanager
     @require_session
@@ -205,7 +194,7 @@ class ElmoClient(object):
             A boolean if the system has been armed correctly.
         """
         payload = {
-            "CommandType": 1,
+            "CommandType": ARM_COMMAND,
             "ElementsClass": 1,
             "ElementsIndexes": 1,
             "sessionId": self._session_id,
@@ -228,7 +217,7 @@ class ElmoClient(object):
             A boolean if the system has been disarmed correctly.
         """
         payload = {
-            "CommandType": 2,
+            "CommandType": DISARM_COMMAND,
             "ElementsClass": 1,
             "ElementsIndexes": 1,
             "sessionId": self._session_id,
@@ -239,7 +228,7 @@ class ElmoClient(object):
 
     @require_session
     @require_lock
-    def arm_sector(self, sector_number):
+    def arm_sectors(self, sector_numbers):
         """Arm selected sector without any activation delay. This API works only
         if a system lock has been obtained, otherwise the action ends with a failure.
         Note: API subject to changes when more configurations are allowed, such as
@@ -251,9 +240,9 @@ class ElmoClient(object):
             A boolean if the sector has been armed correctly.
         """
         payload = {
-            "CommandType": 1,
-            "ElementsClass": 9,
-            "ElementsIndexes": sector_number,
+            "CommandType": ARM_COMMAND,
+            "ElementsClass": SECTOR_CLASS,
+            "ElementsIndexes": sector_numbers,
             "sessionId": self._session_id,
         }
         response = self._session.post(self._router.send_command, data=payload)
@@ -262,7 +251,7 @@ class ElmoClient(object):
 
     @require_session
     @require_lock
-    def disarm_sector(self, sector_number):
+    def disarm_sectors(self, sector_numbers):
         """Deactivate selected sector alarm. This API works only if a system lock has been
         obtained, otherwise the action ends with a failure.
         Note: API subject to changes when more configurations are allowed, such as
@@ -274,75 +263,11 @@ class ElmoClient(object):
             A boolean if the sector has been disarmed correctly.
         """
         payload = {
-            "CommandType": 2,
-            "ElementsClass": 9,
-            "ElementsIndexes": sector_number,
+            "CommandType": DISARM_COMMAND,
+            "ElementsClass": SECTOR_CLASS,
+            "ElementsIndexes": sector_numbers,
             "sessionId": self._session_id,
         }
         response = self._session.post(self._router.send_command, data=payload)
         response.raise_for_status()
         return True
-
-    @require_session
-    def _get_names(self, route):
-        """Generic function that retrieves items from Elmo dashboard.
-
-        Raises:
-            HTTPError: if there is an error raised by the API (not 2xx response).
-        Returns:
-            A list of strings (names) for areas or system inputs.
-        """
-        response = self._session.get(route)
-        response.raise_for_status()
-        return parser.get_listed_items(response.text)
-
-    @require_session
-    def check(self):
-        """Check the Elmo System to get the status of armed or disarmed areas, inputs
-        that are in alerted state or that are waiting. With this method you can check:
-            * The global status if any area is in alerted state
-            * The status for each area, if the alarm is armed or disarmed
-            * The status for each area, if the area is in alerted state
-
-        Raises:
-            HTTPError: if there is an error raised by the API (not 2xx response).
-        Returns:
-            A `dict` object that includes all the above information. The `dict` is in
-            the following format:
-            {
-                "areas_armed": [{"id": 0, "name": "Entryway"}, ...],
-                "areas_disarmed": [{"id": 1, "name": "Kitchen"}, ...],
-                "inputs_alerted": [{"id": 0, "name": "Door"}, ...],
-                "inputs_wait": [{"id": 1, "name": "Window"}, ...],
-            }
-        """
-
-        # Area status
-        response = self._session.post(
-            self._router.areas, data={"sessionId": self._session_id}
-        )
-
-        response.raise_for_status()
-        areas = response.json()
-        areas_names = self._get_names(self._router.areas_list)
-        areas_armed, areas_disarmed = response_helper.slice_list(
-            areas, areas_names, "Active"
-        )
-
-        # System input status
-        response = self._session.post(
-            self._router.inputs, data={"sessionId": self._session_id}
-        )
-        response.raise_for_status()
-        inputs = response.json()
-        inputs_names = self._get_names(self._router.inputs_list)
-        inputs_alerted, inputs_wait = response_helper.slice_list(
-            inputs, inputs_names, "Alarm"
-        )
-
-        return {
-            "areas_armed": areas_armed,
-            "areas_disarmed": areas_disarmed,
-            "inputs_alerted": inputs_alerted,
-            "inputs_wait": inputs_wait,
-        }
