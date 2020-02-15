@@ -1,15 +1,14 @@
 import re
-
 from contextlib import contextmanager
 from threading import Lock
 
 from requests import Session
 
-from .elmo_item import ElmoItem
+from .const import ARM_COMMAND, DISARM_COMMAND, INPUT_CLASS, SECTOR_CLASS
 from .decorators import require_lock, require_session
+from .elmo_item import ElmoItem
 from .exceptions import PermissionDenied
 from .router import Router
-from .const import ARM_COMMAND, DISARM_COMMAND, SECTOR_CLASS, INPUT_CLASS
 from .utils import re_case
 
 
