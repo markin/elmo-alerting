@@ -1,3 +1,5 @@
+import aiohttp
+
 from contextlib import contextmanager
 from threading import Lock
 
@@ -24,9 +26,11 @@ class ElmoClient(object):
             c.disarm()  # Disarm all alarms
     """
 
-    def __init__(self, base_url, vendor, session_id=None):
+    def __init__(self, base_url, vendor, username, password, session_id=None):
         self._router = Router(base_url)
         self._vendor = vendor
+        self._username = username
+        self._password = password
         self._session = Session()
         self._session_id = session_id
         self._lock = Lock()
@@ -59,17 +63,17 @@ class ElmoClient(object):
         return self._session_id
 
     @require_session
-    def _update_strings(self):
+    async def _update_strings(self):
         payload = {"sessionId": self._session_id}
 
-        response = self._session.post(self._router.strings, data=payload)
-        response.raise_for_status()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self._router.strings, data=payload) as response:
+                response.raise_for_status()
 
-        self._strings = response.json()
+                self._strings = await response.json()
 
-    @contextmanager
     @require_session
-    def lock(self, code):
+    async def lock(self, code):
         """Context manager to obtain a system lock. The alerting system allows
         only one user at a time and obtaining the lock is mandatory. When the
         context manager is closed, the lock is automatically released.
@@ -82,16 +86,19 @@ class ElmoClient(object):
             A client instance with an acquired lock.
         """
         payload = {"userId": 1, "password": code, "sessionId": self._session_id}
-        response = self._session.post(self._router.lock, data=payload)
-        response.raise_for_status()
 
-        self._lock.acquire()
-        yield self
-        self.unlock()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self._router.lock, data=payload) as response:
+                response.raise_for_status()
+
+                response = await response.json()
+
+                # self._lock.acquire()
+                # yield self
+                # self.unlock()
 
     @require_session
-    @require_lock
-    def unlock(self):
+    async def unlock(self, code):
         """Release the system lock so that other threads (or this instance) can
         acquire the lock again. This method requires a valid session ID and if called
         when a Lock() is not acquired it bails out.
@@ -106,18 +113,20 @@ class ElmoClient(object):
             A boolean if the lock has been released correctly.
         """
         payload = {"sessionId": self._session_id}
-        response = self._session.post(self._router.unlock, data=payload)
-        response.raise_for_status()
 
-        # Release the lock only in case of success, so that if it fails
-        # the owner of the lock can properly unlock the system again
-        # (maybe with a retry)
-        self._lock.release()
-        return True
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self._router.unlock, data=payload) as response:
+                response.raise_for_status()
+                response = await response.json()
+                # Release the lock only in case of success, so that if it fails
+                # the owner of the lock can properly unlock the system again
+                # (maybe with a retry)
+                # self._lock.release()
+                # return True
 
     @require_session
-    @require_lock
-    def arm(self):
+    #@require_lock
+    async def arm(self, code):
         """Arm all system alarms without any activation delay. This API works only
         if a system lock has been obtained, otherwise the action ends with a failure.
         Note: API subject to changes when more configurations are allowed, such as
@@ -134,9 +143,14 @@ class ElmoClient(object):
             "ElementsIndexes": 1,
             "sessionId": self._session_id,
         }
-        response = self._session.post(self._router.send_command, data=payload)
-        response.raise_for_status()
-        return True
+
+        await self.lock(code)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self._router.send_command, data=payload) as response:
+                response.raise_for_status()
+                response = await response.json()
+        await self.unlock(code)
+        #return True
 
     @require_session
     @require_lock
@@ -229,7 +243,7 @@ class ElmoClient(object):
         return element
 
     @require_session
-    def check(self):
+    async def check(self):
         """Check the Elmo System to get the status of armed or disarmed areas, inputs
         that are in alerted state or that are waiting. With this method you can check:
             * The global status if any area is in alerted state
@@ -248,34 +262,6 @@ class ElmoClient(object):
                 "inputs_wait": [{"id": 1, "name": "Window"}, ...],
             }
         """
-        # Retrieves strings if not present
-        if not self._strings:
-            self._update_strings()
-
-        payload = {"sessionId": self._session_id}
-
-        # Retrieve areas
-        response = self._session.post(self._router.areas, data=payload)
-        response.raise_for_status()
-
-        areas = response.json()
-        areas = list(filter(lambda area: area["InUse"], areas))
-        areas = list(map(lambda x: self._get_names(x, 9), areas))
-
-        areas_armed = list(filter(lambda area: area["Active"], areas))
-        areas_disarmed = list(filter(lambda area: not area["Active"], areas))
-
-        # Retrieve inputs
-        response = self._session.post(self._router.inputs, data=payload)
-        response.raise_for_status()
-
-        inputs = response.json()
-        inputs = list(filter(lambda input_: input_["InUse"], inputs))
-        inputs = list(map(lambda x: self._get_names(x, 10), inputs))
-
-        inputs_alerted = list(filter(lambda input_: input_["Alarm"], inputs))
-        inputs_wait = list(filter(lambda input_: not input_["Alarm"], inputs))
-
         def set_output_dict(item):
             entry = {
                 "id": item["Id"],
@@ -285,14 +271,46 @@ class ElmoClient(object):
             }
             return entry
 
-        areas_armed = list(map(lambda x: set_output_dict(x), areas_armed))
-        areas_disarmed = list(map(lambda x: set_output_dict(x), areas_disarmed))
-        inputs_alerted = list(map(lambda x: set_output_dict(x), inputs_alerted))
-        inputs_wait = list(map(lambda x: set_output_dict(x), inputs_wait))
+        # Retrieves strings if not present
+        if not self._strings:
+            await self._update_strings()
 
+        payload = {"sessionId": self._session_id}
+
+        # Retrieve areas
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self._router.areas, data=payload) as response:
+                response.raise_for_status()
+
+                areas = await response.json()
+                areas = list(filter(lambda area: area["InUse"], areas))
+                areas = list(map(lambda x: self._get_names(x, 9), areas))
+
+                areas_armed = list(filter(lambda area: area["Active"], areas))
+                areas_disarmed = list(filter(lambda area: not area["Active"], areas))
+
+                self.areas_armed = list(map(lambda x: set_output_dict(x), areas_armed))
+                self.areas_disarmed = list(map(lambda x: set_output_dict(x), areas_disarmed))
+
+        # Retrieve inputs
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self._router.inputs, data=payload) as response:
+                response.raise_for_status()
+
+                inputs = await response.json()
+                inputs = list(filter(lambda input_: input_["InUse"], inputs))
+                inputs = list(map(lambda x: self._get_names(x, 10), inputs))
+
+                inputs_alerted = list(filter(lambda input_: input_["Alarm"], inputs))
+                inputs_wait = list(filter(lambda input_: not input_["Alarm"], inputs))
+
+                self.inputs_alerted = list(map(lambda x: set_output_dict(x), inputs_alerted))
+                self.inputs_wait = list(map(lambda x: set_output_dict(x), inputs_wait))
+
+    def get_state(self):
         return {
-            "areas_armed": areas_armed,
-            "areas_disarmed": areas_disarmed,
-            "inputs_alerted": inputs_alerted,
-            "inputs_wait": inputs_wait,
+            "areas_armed": self.areas_armed,
+            "areas_disarmed": self.areas_disarmed,
+            "inputs_alerted": self.inputs_alerted,
+            "inputs_wait": self.inputs_wait,
         }
